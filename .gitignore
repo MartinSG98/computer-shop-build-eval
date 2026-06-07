@@ -1,0 +1,11 @@
+# Catalog snapshot is generated locally from the products API, not committed.
+catalog.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Model artifact (uploaded to S3, not committed)
+model.onnx

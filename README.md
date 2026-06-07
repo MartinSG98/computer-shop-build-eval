@@ -45,6 +45,8 @@ One JSON object per line:
 
 ## Refreshing the catalog snapshot
 
+Point `PRODUCTS_API` at your products API base URL:
+
 ```
-curl -s https://api.msg-computers.com/products -o catalog.json
+curl -s "$PRODUCTS_API/products" -o catalog.json
 ```
