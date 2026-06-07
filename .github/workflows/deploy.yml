@@ -37,7 +37,7 @@ jobs:
           rm -rf build code.zip
           mkdir build
           pip install --target build -r app/requirements.txt
-          cp features.py compat.py catalog.py build/
+          cp features.py compat.py catalog.py suggest.py catalog.json build/
           mkdir build/app
           cp app/__init__.py app/handler.py build/app/
           (cd build && zip -r -q ../code.zip .)
