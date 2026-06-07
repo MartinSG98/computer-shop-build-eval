@@ -1,0 +1,6 @@
+# Training / dev dependencies (offline). The Lambda uses app/requirements.txt.
+numpy
+scikit-learn
+skl2onnx
+onnx
+onnxruntime

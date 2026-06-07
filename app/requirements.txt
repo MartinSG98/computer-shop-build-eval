@@ -1,0 +1,3 @@
+# Lambda inference dependencies only (kept lean for a small package / fast cold start).
+numpy
+onnxruntime
