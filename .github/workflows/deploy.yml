@@ -26,10 +26,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 3.11 must match the Lambda runtime so the onnxruntime/numpy wheels fit.
+      # 3.12 must match the Lambda runtime (Amazon Linux 2023) so the
+      # onnxruntime/numpy wheels load.
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Build Lambda package
         run: |
