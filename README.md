@@ -41,7 +41,8 @@ Incompatible builds score very low (the `error_count` feature plus the labels).
 
 `.github/workflows/deploy.yml` runs on push to `main` (and manual dispatch):
 build the package (handler + features/compat/catalog + onnxruntime/numpy on
-Python 3.11), upload `model.onnx` to S3, then deploy the code zip via S3 and
+Python 3.12, matching the Lambda runtime), upload `model.onnx` to S3, then
+deploy the code zip via S3 and
 `update-function-code`. Auth is GitHub OIDC (no stored keys).
 
 Set these repository **variables** (Settings -> Secrets and variables -> Actions
