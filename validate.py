@@ -75,11 +75,11 @@ def main(paths: list[str]) -> None:
                 seen.add(key)
                 clean.append(row)
 
-    with open("clean.jsonl", encoding="utf-8", mode="w") as f:
+    with open("data/clean.jsonl", encoding="utf-8", mode="w") as f:
         for row in clean:
             f.write(json.dumps(row) + "\n")
 
-    print(f"read {total} rows -> {len(clean)} valid written to clean.jsonl")
+    print(f"read {total} rows -> {len(clean)} valid written to data/clean.jsonl")
     if reasons:
         print("dropped:")
         for reason, count in reasons.most_common():
