@@ -26,6 +26,7 @@ import onnxruntime as ort
 from catalog import BUILD_SLOTS
 from compat import evaluate
 from features import RESOLUTION_ORDINAL, USE_CASES, build_features
+from suggest import suggest
 
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 # Incompatible builds are forced below this so the gauge always reads "broken",
@@ -98,5 +99,8 @@ def handler(event: dict, context=None) -> dict:
     score = max(0.0, min(100.0, raw))
     if errors:
         score = min(score, INCOMPATIBLE_CAP)
+    score = round(score)
 
-    return _response(200, {"score": round(score), "errors": errors, "warnings": warnings})
+    recommendations = suggest(build, use_case, resolution, score, not errors)
+
+    return _response(200, {"score": score, "errors": errors, "warnings": warnings, "recommendations": recommendations})
