@@ -1,0 +1,70 @@
+name: Deploy build evaluator
+
+on:
+  push:
+    branches: [main]
+    # Docs-only changes don't affect the Lambda or model.
+    paths-ignore:
+      - "**/*.md"
+  workflow_dispatch:
+
+# OIDC: assume the eval deploy role keylessly. No stored AWS keys.
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: build-eval-deploy
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: eu-west-2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 3.11 must match the Lambda runtime so the onnxruntime/numpy wheels fit.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build Lambda package
+        run: |
+          rm -rf build code.zip
+          mkdir build
+          pip install --target build -r app/requirements.txt
+          cp features.py compat.py catalog.py build/
+          mkdir build/app
+          cp app/__init__.py app/handler.py build/app/
+          (cd build && zip -r -q ../code.zip .)
+          ls -lh code.zip
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # Repository variables (not secrets); OIDC trust restricts who can assume.
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Upload model and deploy code
+        env:
+          RAW_BUCKET: ${{ vars.MODELS_BUCKET }}
+          RAW_KEY: ${{ vars.MODEL_KEY }}
+          RAW_FN: ${{ vars.EVAL_LAMBDA_FUNCTION }}
+        run: |
+          # Strip stray whitespace that can sneak into repo variables.
+          BUCKET="$(printf '%s' "$RAW_BUCKET" | tr -d '[:space:]')"
+          KEY="$(printf '%s' "$RAW_KEY" | tr -d '[:space:]')"
+          FN="$(printf '%s' "$RAW_FN" | tr -d '[:space:]')"
+          # The Lambda reads the model from S3 at this key.
+          aws s3 cp model.onnx "s3://$BUCKET/$KEY"
+          # Code is too large for a direct zip upload, so deploy via S3.
+          aws s3 cp code.zip "s3://$BUCKET/build-eval/code.zip"
+          aws lambda update-function-code \
+            --function-name "$FN" \
+            --s3-bucket "$BUCKET" \
+            --s3-key build-eval/code.zip \
+            --publish
