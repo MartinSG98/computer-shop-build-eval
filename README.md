@@ -37,6 +37,26 @@ Incompatible builds score very low (the `error_count` feature plus the labels).
 4. `python tests/smoke_test.py` -> eyeball scores on sample builds.
 5. Deploy the eval Lambda (Terraform, in the module) which loads the model from S3 and serves the score.
 
+## Deploy (CI)
+
+`.github/workflows/deploy.yml` runs on push to `main` (and manual dispatch):
+build the package (handler + features/compat/catalog + onnxruntime/numpy on
+Python 3.11), upload `model.onnx` to S3, then deploy the code zip via S3 and
+`update-function-code`. Auth is GitHub OIDC (no stored keys).
+
+Set these repository **variables** (Settings -> Secrets and variables -> Actions
+-> Variables); values come from `terraform output` in `tf-stack-computer_shop`:
+
+| Variable | Terraform output |
+| --- | --- |
+| `AWS_DEPLOY_ROLE_ARN` | `github_eval_deploy_role_arn` |
+| `EVAL_LAMBDA_FUNCTION` | `eval_lambda_function_name` |
+| `MODELS_BUCKET` | `models_bucket_name` |
+| `MODEL_KEY` | `eval_model_key` |
+
+The infra (Lambda, models bucket, `/evaluate` route, OIDC role) is created by the
+Terraform module before the first deploy.
+
 ## Data format
 
 One JSON object per line:
