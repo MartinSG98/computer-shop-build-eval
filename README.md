@@ -141,3 +141,13 @@ Point `PRODUCTS_API` at your products API base URL:
 ```
 curl -s "$PRODUCTS_API/products" -o catalog.json
 ```
+
+## Related
+
+Part of the Computer Shop project:
+
+- [computer-shop-backend](https://github.com/MartinSG98/computer-shop-backend) — FastAPI backend API
+- [computer_shop_ui](https://github.com/MartinSG98/computer_shop_ui) — React/Vite/Mantine frontend
+- [computer-shop-support-agent](https://github.com/MartinSG98/computer-shop-support-agent) — customer support agent (Bedrock AgentCore Runtime)
+- [tf-module-computer_shop](https://github.com/MartinSG98/tf-module-computer_shop) — Terraform infrastructure module
+- [tf-stack-computer_shop](https://github.com/MartinSG98/tf-stack-computer_shop) — Terraform deployment stack
