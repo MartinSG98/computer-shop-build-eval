@@ -1,90 +1,122 @@
-# computer-shop-build-eval
+# Computer Shop build evaluator
 
-Build evaluator for the Computer Shop PC configurator. A small model scores a
-complete PC build 0 to 100 for a given use case and resolution. Trained offline
-on LLM-labeled builds, exported to ONNX, and served by a dedicated Lambda that
-loads the model from S3.
+Build evaluator for Computer Shop, a web shop for PC parts. On the Build a PC page you fill eight slots (processor, motherboard, CPU cooler, memory, graphics card, storage, power supply and case), say what the PC is for (gaming, content creation or everyday work) and pick a resolution (1080p, 1440p or 4K). You get back a score from 0 to 100 and up to three concrete changes from the shop's own catalog. The score comes from a small gradient-boosted model trained offline on 4,000 LLM-labeled builds, exported to ONNX and served by a dedicated Lambda. The suggestions come from Amazon Nova Lite on Bedrock, asked on the fly by the same Lambda.
 
-The same Lambda also returns up to three catalog-grounded improvement
-suggestions, generated on the fly by an Amazon Bedrock model (Nova Lite). The
-score is a fixed number from the ONNX model; the suggestions are the qualitative
-read that explains how to make the build better.
+This repo holds the labeled data, the training pipeline, the trained `model.onnx` and the Lambda. The configurator that calls it lives in [computer_shop_ui](https://github.com/MartinSG98/computer_shop_ui) and posts the full product objects it already has loaded, so the Lambda never touches the database. The products come from [computer-shop-backend](https://github.com/MartinSG98/computer-shop-backend). Its `app/seed_data.py` is what the builds were labeled from, and `catalog.json` here is a snapshot of its `GET /products`. The Lambda, its model bucket and the `POST /evaluate` route on the shop's HTTP API are defined in [tf-module-computer_shop](https://github.com/MartinSG98/tf-module-computer_shop) and applied through [tf-stack-computer_shop](https://github.com/MartinSG98/tf-stack-computer_shop).
+
+Architecture decisions are recorded in [docs/adr](docs/adr/README.md), one numbered file per decision.
 
 ## How a build is scored
 
-Each build plus scenario (use case + resolution) becomes a fixed feature vector
-(see `features.py`), and the model predicts a 0 to 100 score. The score reflects
-how well-suited and balanced the build is for that use:
+1. **The request.** The configurator posts `{"build": {...}, "use_case": "gaming", "resolution": "1440p"}` to `/evaluate`. `build` has exactly the eight slots, keyed by category slug (`processors`, `motherboards`, `cpu-coolers`, `memory`, `graphics-cards`, `storage`, `power-supplies`, `cases`), and each holds the full catalog product with its `attributes`, `specs` and `price`. A body that is not JSON, a missing or extra slot, or an unknown use case or resolution answers 400 with the reason.
+2. **Compatibility.** `compat.py`, a Python port of the configurator's compatibility engine (`src/lib/compatibility.ts` in computer_shop_ui), returns error and warning codes (see Compatibility rules).
+3. **Features.** `features.py` turns the build and the scenario into 17 numbers. Training uses the same file, so the feature math cannot drift between training and serving.
+4. **The score.** The ONNX model predicts a score, which is clipped to 0-100. A build with any compatibility error is capped at 19, so the gauge always reads broken, even when the model wobbles a little in the 0-20 range. The result is rounded to a whole number.
+5. **Suggestions.** `suggest.py` asks Bedrock for up to three improvement tips (see Suggestions).
+6. **The response.** Every response carries CORS headers for `POST` and `OPTIONS`, and an `OPTIONS` preflight answers 200 straight away.
 
-- Gaming: GPU-weighted (more at higher resolution), favors 3D V-Cache CPUs.
-- Content creation: CPU cores/threads and RAM weighted, plus GPU VRAM.
-- Everyday/office: modest parts ideal, high-end parts are overkill.
+```json
+{"score": 88, "errors": [], "warnings": ["psu_headroom"], "recommendations": ["Upgrade to the ..."]}
+```
 
-Incompatible builds score very low (the `error_count` feature plus the labels).
+The score says how well suited and balanced the build is for that use, following the labels:
+
+- **Gaming** weighs the graphics card most, more so at higher resolutions, and favours CPUs with 3D V-Cache.
+- **Content creation** weighs CPU cores and threads and RAM, plus graphics card VRAM.
+- **Everyday** work suits modest parts. High-end parts count as overkill and lower the score.
+
+Incompatible builds already score very low through the `error_count` feature and the labels, and the cap makes sure of it. With the current model, the flagship test build (Ryzen 9 9950X and RTX 5090) scores 93 for content creation at 4K and 23 for office work at 1080p.
+
+## Compatibility rules
+
+The draw estimate is the CPU's TDP plus the graphics card's TDP plus 100 W. Each rule skips itself when the parts or attributes it needs are missing.
+
+| Code | Kind | When |
+|---|---|---|
+| `cpu_mobo_socket` | error | The CPU and motherboard sockets differ |
+| `cooler_socket` | error | The cooler does not list the CPU's socket |
+| `cooler_height` | error | An air cooler is taller than the case allows |
+| `radiator_size` | error | An AIO radiator is larger than the case takes |
+| `ram_type` | error | The memory type differs from the motherboard's |
+| `ram_slots` | error | The kit has more sticks than the motherboard has slots |
+| `mobo_form_factor` | error | The case does not take the motherboard's form factor |
+| `gpu_length` | error | The graphics card is longer than the case allows |
+| `psu_form_factor` | error | The case does not take the power supply's form factor |
+| `psu_underpowered` | error | The power supply's wattage is below the estimated draw |
+| `psu_headroom` | warning | The power supply covers the draw with less than 20 percent to spare |
+| `cooler_underrated` | warning | The cooler's TDP rating is below the CPU's TDP |
+| `ram_capacity` | warning | The kit is larger than the motherboard's maximum |
+| `no_display` | warning | The CPU has no integrated graphics and there is no graphics card |
+
+## Features
+
+The order is fixed in `FEATURE_NAMES`, because training and inference have to agree on it.
+
+| Feature | Made from |
+|---|---|
+| `cpu_cores`, `cpu_threads` | The first number in the CPU's `cores` and `threads` specs |
+| `cpu_has_x3d` | 1 when the CPU's `cache` spec mentions 3D V-Cache |
+| `cpu_tdp_w`, `cpu_tier` | The CPU's attributes |
+| `gpu_vram_gb` | The first number in the graphics card's `vram` spec |
+| `gpu_tdp_w`, `gpu_tier` | The graphics card's attributes |
+| `ram_capacity_gb` | The memory kit's capacity |
+| `est_draw_w` | The draw estimate above, 0 when neither TDP is known |
+| `psu_headroom_ratio` | The power supply's wattage divided by the draw estimate |
+| `error_count` | The number of compatibility errors |
+| `total_price` | The sum of the eight prices |
+| `use_gaming`, `use_content`, `use_everyday` | The use case, one-hot |
+| `resolution` | 0 for 1080p, 1 for 1440p, 2 for 4k |
 
 ## Suggestions
 
-After scoring, the Lambda asks a Bedrock model (Amazon Nova Lite by default) for
-up to three short improvement tips for the chosen use case and resolution. The
-build, its score, and a compact summary of the whole catalog are passed as
-context, so the model can only reference parts and specs the shop actually sells
-(no invented products). See `suggest.py` for the prompt and grounding.
+After scoring, the Lambda calls the Bedrock Converse API with `SUGGEST_MODEL_ID`, which defaults to Amazon Nova Lite (`amazon.nova-lite-v1:0`), at temperature 0 and with at most 500 tokens. The message holds the use case, the resolution, the score, whether the build is compatible, a one-line summary of each part (its tier plus the specs that matter for its slot), and the same kind of summary for every buildable part in the bundled `catalog.json`, grouped by slot. That way the model has every part the shop sells in front of it, and the prompt forbids it to name anything else.
 
-Suggestions are **best effort**: any failure (missing Bedrock access, timeout,
-unparseable reply) is caught and returns an empty list, so the score always
-responds. The model id is read from the `SUGGEST_MODEL_ID` env var.
+The system prompt in `suggest.py` defines an upgrade as a higher-tier part in the same slot and a cheaper option as a lower-tier one, says what matters for each use case, and makes every tip swap exactly one part for another from the catalog. Tips start with "Upgrade to ..." for a stronger part, or "Save money with ..." or "A cheaper option is ..." for a weaker one. A build scoring 90 or more gets at most one tip, and a build that is already a strong fit gets none. The reply has to be the JSON object `{"suggestions": [...]}`. The parser reads from the first `{` to the last `}`, which tolerates code fences, and keeps at most three non-empty tips.
 
-`boto3` is provided by the Lambda runtime, so it is not in `app/requirements.txt`.
-To run the suggestion test locally, install it into your venv: `pip install boto3`.
+Suggestions are best effort. Any failure, from missing Bedrock access to a timeout or a reply that does not parse, returns an empty list, so the score always comes back ([ADR 0002](docs/adr/0002-best-effort-bedrock-suggestions.md)). `boto3` comes with the Lambda runtime, so it is not in `app/requirements.txt`.
 
-## Files
+## Running locally
 
-- `catalog.py` - load `catalog.json` (snapshot of the live products API) as id -> product; resolve a build's slot -> id map into products.
-- `compat.py` - Python port of the frontend compatibility engine; returns errors/warnings for a build.
-- `suggest.py` - catalog-grounded improvement tips via Amazon Bedrock (Nova Lite). Best effort: returns `[]` on any failure so the score still responds.
-- `features.py` - build + scenario -> feature vector. **Shared by training and the Lambda** so the math is identical.
-- `validate.py` - clean raw LLM rows into `data/clean.jsonl` (drops bad ids/slots/scores, dedupes, reports coverage).
-- `train.py` - read `data/clean.jsonl`, build features, train a gradient-boosted regressor, export `model.onnx`.
-- `app/handler.py` - Lambda: validates the request, computes features, loads `model.onnx` from S3 (local file fallback for dev), returns a 0-100 score (incompatible builds hard-capped) plus `recommendations`.
-- `tests/smoke_test.py` - score a handful of example builds to sanity-check the model.
-- `tests/suggest_test.py` - print the Bedrock suggestions for example builds (live call; needs AWS creds + Bedrock access).
-- `tests/test_handler.py` - exercises the Lambda handler with simulated requests (scoring, compat cap, validation, CORS).
-- `data/` - training data. `builds.jsonl` (raw labels) is committed; `clean.jsonl` is generated by validate.py and gitignored.
+Requires Python 3.11 or newer.
 
-## Pipeline
+```bash
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+source .venv/bin/activate     # macOS / Linux
+pip install -r requirements.txt
+python tests/smoke_test.py
+```
 
-1. Generate labeled builds with Claude/ChatGPT (build + use_case + resolution + score), save to `data/builds.jsonl` (committed as the dataset of record).
-2. `python validate.py data/builds.jsonl` -> `data/clean.jsonl` + a coverage report.
-3. `python train.py` -> `model.onnx` (uploaded to S3).
-4. `python tests/smoke_test.py` -> eyeball scores on sample builds.
-5. Deploy the eval Lambda (Terraform, in the module) which loads the model from S3 and serves the score.
+There is no local server. The handler is a plain function, so the tests call it in-process with simulated API Gateway events, and with `MODEL_BUCKET` unset it loads `model.onnx` from the repo root. `requirements.txt` holds the training packages (numpy, scikit-learn, skl2onnx, onnx and onnxruntime), which also cover the handler. Suggestions need boto3 as well (`pip install boto3`), plus AWS credentials with Bedrock access to Nova Lite and a default region where it is available, such as eu-west-2, set with `AWS_DEFAULT_REGION` or in your AWS profile. Without those the score still works and `recommendations` comes back empty.
 
-## Deploy (CI)
+## Configuration
 
-`.github/workflows/deploy.yml` runs on push to `main` (and manual dispatch):
-build the package (handler + features/compat/catalog/suggest + `catalog.json` +
-onnxruntime/numpy on Python 3.12, matching the Lambda runtime), upload
-`model.onnx` to S3, then deploy the code zip via S3 and
-`update-function-code`. Auth is GitHub OIDC (no stored keys).
+These are the Lambda's environment variables. Terraform sets all four in AWS.
 
-The Lambda's execution role needs `bedrock:InvokeModel` for the suggestion model,
-and the `SUGGEST_MODEL_ID` env var. Both are set by the Terraform module. Without
-them the score still works; suggestions just come back empty.
+| Variable | Default | Purpose |
+|---|---|---|
+| `MODEL_BUCKET` | unset | S3 bucket the model is loaded from. Unset loads `model.onnx` from the repo root |
+| `MODEL_KEY` | `model.onnx` | Key of the model in that bucket |
+| `ALLOWED_ORIGIN` | `*` | `Access-Control-Allow-Origin` on every response |
+| `SUGGEST_MODEL_ID` | `amazon.nova-lite-v1:0` | Bedrock model for the suggestions |
 
-Set these repository **variables** (Settings -> Secrets and variables -> Actions
--> Variables); values come from `terraform output` in `tf-stack-computer_shop`:
+The model is loaded once per warm container and kept for every request after that.
 
-| Variable | Terraform output |
-| --- | --- |
-| `AWS_DEPLOY_ROLE_ARN` | `github_eval_deploy_role_arn` |
-| `EVAL_LAMBDA_FUNCTION` | `eval_lambda_function_name` |
-| `MODELS_BUCKET` | `models_bucket_name` |
-| `MODEL_KEY` | `eval_model_key` |
+## Training a model
 
-The infra (Lambda, models bucket, `/evaluate` route, OIDC role) is created by the
-Terraform module before the first deploy.
+```bash
+python validate.py data/builds.jsonl   # writes data/clean.jsonl and prints a coverage report
+python train.py                        # writes model.onnx
+python tests/smoke_test.py             # eyeball the scores of sample builds
+```
 
-## Data format
+1. **Label builds.** An LLM (Claude or ChatGPT) generates and rates builds from the backend's seed file, with the prompt below, and the output goes to `data/builds.jsonl`, the dataset of record. It holds 4,000 builds, split almost evenly across the three use cases and the three resolutions.
+2. **Validate.** `validate.py` drops rows that are not valid JSON, do not have exactly the eight slots, use an unknown product id or put a product in the wrong slot, or have a score outside 0-100 or an unknown use case or resolution. It keeps the first of any identical build and scenario rows. It takes several files at once and also accepts a JSON array written one object per line. The report counts rows per use case, per resolution and per 20-point score band. `data/clean.jsonl` is generated, so it is git-ignored. All 4,000 current rows pass.
+3. **Train.** `train.py` resolves each row's product ids through `catalog.json`, builds the features, holds out 15 percent and trains a scikit-learn `GradientBoostingRegressor` (400 trees, learning rate 0.05, depth 3, subsample 0.9, seed 42). It prints the holdout MAE and R2 and the six most important features, then refits on every row and exports `model.onnx` with skl2onnx (opset 17, one float input of 17 features).
+4. **Check.** `tests/smoke_test.py` prints the score of eleven hand-picked scenarios next to what you would expect.
+5. **Ship.** Commit `model.onnx` and push to `main`. The deploy workflow uploads it to S3, where the Lambda loads it from.
+
+### Data format
 
 One JSON object per line:
 
@@ -92,14 +124,11 @@ One JSON object per line:
 {"build": {"processors": "<id>", "motherboards": "<id>", "cpu-coolers": "<id>", "memory": "<id>", "graphics-cards": "<id>", "storage": "<id>", "power-supplies": "<id>", "cases": "<id>"}, "use_case": "gaming", "resolution": "1440p", "score": 88, "reason": "..."}
 ```
 
-`use_case`: gaming | content | everyday. `resolution`: 1080p | 1440p | 4k.
+`use_case` is one of `gaming`, `content` or `everyday`, and `resolution` one of `1080p`, `1440p` or `4k`.
 
-## Generating labeled data (the prompt)
+### Generating labeled data
 
-Paste this into an LLM along with the backend seed file (`app/seed_data.py`), which
-lists every product and its id. Run it on one model for consistency (mixing
-labelers with different scales adds noise). Save the output to `data/builds.jsonl`
-(committed as the dataset of record).
+Paste this prompt into an LLM along with the backend's seed file (`app/seed_data.py`), which lists every product and its id. Run it on one model for consistency, because mixing labelers with different scales adds noise. A single reply will not fit 2,000 lines, so the output comes in chunks: say "continue" and append each chunk to `data/builds.jsonl`.
 
 ```
 Using ONLY the products in the attached file, generate and rate as many diverse
@@ -131,23 +160,69 @@ Output ONLY JSONL, one object per line, no prose or code fences:
 {"build": {"processors": "<id>", "motherboards": "<id>", "cpu-coolers": "<id>", "memory": "<id>", "graphics-cards": "<id>", "storage": "<id>", "power-supplies": "<id>", "cases": "<id>"}, "use_case": "gaming", "resolution": "1440p", "score": 88, "reason": "<one short sentence>"}
 ```
 
-A single reply won't fit 2000 lines, so it comes in chunks: say "continue" and
-append each chunk to the same file.
+### Refreshing the catalog snapshot
 
-## Refreshing the catalog snapshot
+`catalog.json` is used three times. Validation checks ids and slots against it, training resolves ids through it, and the Lambda bundles it for the suggestions' catalog summary. The score itself does not depend on it, since the configurator posts full products. When the shop's catalog changes, point `PRODUCTS_API` at the backend's base URL, refresh the snapshot and redeploy:
 
-Point `PRODUCTS_API` at your products API base URL:
-
-```
+```bash
 curl -s "$PRODUCTS_API/products" -o catalog.json
 ```
 
-## Related
+## Tests
 
-Part of the Computer Shop project:
+```bash
+python tests/test_handler.py
+python tests/smoke_test.py
+python tests/suggest_test.py
+```
 
-- [computer-shop-backend](https://github.com/MartinSG98/computer-shop-backend) — FastAPI backend API
-- [computer_shop_ui](https://github.com/MartinSG98/computer_shop_ui) — React/Vite/Mantine frontend
-- [computer-shop-support-agent](https://github.com/MartinSG98/computer-shop-support-agent) — customer support agent (Bedrock AgentCore Runtime)
-- [tf-module-computer_shop](https://github.com/MartinSG98/tf-module-computer_shop) — Terraform infrastructure module
-- [tf-stack-computer_shop](https://github.com/MartinSG98/tf-stack-computer_shop) — Terraform deployment stack
+- `test_handler.py` runs the handler in-process against the local model. A good build scores 70 or more, an AM5 CPU on an Intel board is flagged `cpu_mobo_socket` and capped at 19, the same build scores higher for 4K gaming than for office work, a missing build or an unknown use case or resolution answers 400, and the preflight answers 200 with a CORS header. It prints PASS or FAIL per test and exits non-zero on a failure, and it also runs under pytest if you have it installed. If boto3, AWS credentials and a default region are available, every scored request also makes a live Bedrock call for suggestions.
+- `smoke_test.py` prints eleven scenarios next to what you would expect, such as a flagship scoring low for office work and the 9800X3D beating the 9950X for gaming but not for content creation.
+- `suggest_test.py` prints the live Bedrock suggestions for five scenarios, so you can check that every part they name exists in the catalog. It needs AWS credentials with `bedrock:InvokeModel` on Nova Lite and a default region where Nova Lite is available. When every scenario comes back empty, the cause is usually credentials, the region or model access, not five perfect builds.
+
+Nothing runs these in CI. The only workflow is the deploy.
+
+## Deployment
+
+`.github/workflows/deploy.yml` runs on pushes to `main`, except ones that only touch Markdown files, and can also be started by hand.
+
+1. **Package.** On Python 3.12, which matches the Lambda runtime on Amazon Linux 2023 so that the onnxruntime and numpy wheels load, it installs `app/requirements.txt` into a build folder and adds `features.py`, `compat.py`, `catalog.py`, `suggest.py`, `catalog.json` and `app/handler.py`.
+2. **Authenticate.** It assumes the evaluator's deploy role through GitHub OIDC, so no AWS keys are stored.
+3. **Upload the model.** `model.onnx` goes to the models bucket at `MODEL_KEY`, where the Lambda reads it.
+4. **Deploy the code.** The zip is too large for a direct upload, so it goes to `build-eval/code.zip` in the same bucket, and `aws lambda update-function-code --publish` points the function at it.
+
+The workflow reads four repository variables (Settings, Secrets and variables, Actions, Variables), each from a `terraform output` of [tf-stack-computer_shop](https://github.com/MartinSG98/tf-stack-computer_shop). It strips stray whitespace from them before use.
+
+| Variable | Terraform output |
+|---|---|
+| `AWS_DEPLOY_ROLE_ARN` | `github_eval_deploy_role_arn` |
+| `EVAL_LAMBDA_FUNCTION` | `eval_lambda_function_name` |
+| `MODELS_BUCKET` | `models_bucket_name` |
+| `MODEL_KEY` | `eval_model_key` |
+
+Terraform creates the Lambda (Python 3.12, handler `app.handler.handler`), the versioned models bucket, the `POST /evaluate` and `OPTIONS /evaluate` routes and the deploy role before the first deploy, and it ignores code changes after that. The execution role can read the model and call `bedrock:InvokeModel` on the suggestion model. Without Bedrock access the score still works and the suggestions just come back empty. Deploys share a concurrency group, so a second push waits for the first instead of cancelling it.
+
+## Structure
+
+```
+app/
+├── handler.py          the Lambda: validation, compatibility, features, score, suggestions, CORS
+└── requirements.txt    numpy and onnxruntime, the only packages in the Lambda zip
+catalog.py              catalog.json as id to product, and the eight build slots
+catalog.json            snapshot of the backend's GET /products, bundled into the Lambda
+compat.py               Python port of the configurator's compatibility rules
+features.py             build and scenario to the 17 features, shared by training and the Lambda
+suggest.py              Bedrock prompt, catalog summary and reply parsing for the suggestions
+validate.py             raw labeled rows to data/clean.jsonl, with a coverage report
+train.py                trains the regressor and exports model.onnx
+model.onnx              the trained model the deploy uploads to S3
+data/builds.jsonl       the labeled builds, the dataset of record
+tests/
+├── test_handler.py     the handler with simulated API Gateway events
+├── smoke_test.py       scores hand-picked builds to eyeball the model
+└── suggest_test.py     prints live Bedrock suggestions for example builds
+docs/adr/               architecture decision records
+.github/workflows/
+└── deploy.yml          package, upload the model and deploy the Lambda
+requirements.txt        training and local dependencies
+```
